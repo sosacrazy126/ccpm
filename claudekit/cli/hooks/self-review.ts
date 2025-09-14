@@ -1,0 +1,236 @@
+import type { HookContext, HookResult } from './base.js';
+import { BaseHook } from './base.js';
+import { getHookConfig } from '../utils/claudekit-config.js';
+import { TranscriptParser } from '../utils/transcript-parser.js';
+import { AgentLoader } from '../lib/loaders/agent-loader.js';
+
+interface FocusArea {
+  name: string;
+  questions: string[];
+}
+
+interface SelfReviewConfig {
+  timeout?: number | undefined;
+  focusAreas?: FocusArea[] | undefined;
+  targetPatterns?: string[] | undefined; // Glob patterns to match files (e.g., ['**/*.ts', '!**/*.test.ts'])
+}
+
+// Unique marker to identify self-review messages in the transcript
+const SELF_REVIEW_MARKER = '📋 **Self-Review**';
+
+export class SelfReviewHook extends BaseHook {
+  name = 'self-review';
+
+  static metadata = {
+    id: 'self-review',
+    displayName: 'Self Review',
+    description: 'Prompts a critical self-review to catch integration and refactoring issues',
+    category: 'validation' as const,
+    triggerEvent: ['Stop', 'SubagentStop'] as const,
+    matcher: '*',
+  };
+
+  private readonly defaultFocusAreas: FocusArea[] = [
+    {
+      name: 'Implementation Completeness',
+      questions: [
+        'Did you create a mock implementation just to pass tests instead of real functionality?',
+        'Are there any "Not implemented yet" placeholders or TODO comments in production code?',
+        'Does the implementation actually do what it claims, or just return hardcoded values?',
+        'Did you stub out functionality with placeholder messages instead of real logic?',
+        'Are all the features actually working, or just pretending to work?',
+        'Did you implement the full solution or just the minimum to make tests green?',
+        'Did you finish what you started or leave work half-done?',
+      ],
+    },
+    {
+      name: 'Code Quality',
+      questions: [
+        'Did you leave the code better than you found it?',
+        'Is there duplicated logic that should be extracted?',
+        'Are you using different patterns than the existing code uses?',
+        'Is the code more complex now than it needs to be?',
+        'Did you clean up after making your changes work?',
+        'Is every piece of code still serving a clear purpose?',
+      ],
+    },
+    {
+      name: 'Integration & Refactoring',
+      questions: [
+        'Did you just add code on top without integrating it properly?',
+        'Should you extract the new functionality into cleaner abstractions?',
+        'Would refactoring the surrounding code make everything simpler?',
+        'Does the code structure still make sense after your additions?',
+        'Should you consolidate similar functions that now exist?',
+        'Did you leave any temporary workarounds or hacks?',
+      ],
+    },
+    {
+      name: 'Codebase Consistency',
+      questions: [
+        'Should other parts of the codebase be updated to match your improvements?',
+        'Did you update all the places that depend on what you changed?',
+        'Are there related files that need the same changes?',
+        'Did you create a utility that existing code could benefit from?',
+        'Should your solution be applied elsewhere for consistency?',
+        'Are you following the same patterns used elsewhere in the codebase?',
+      ],
+    },
+  ];
+
+  private selectRandomQuestionFromArea(area: FocusArea): string {
+    const index = Math.floor(Math.random() * area.questions.length);
+    const question = area.questions[index];
+    if (question === undefined || question === null || question === '') {
+      // Fallback to first question if somehow index is invalid
+      return area.questions[0] ?? 'Is the code clean and well-integrated?';
+    }
+    return question;
+  }
+
+  private getReviewQuestions(config: SelfReviewConfig): Array<{ area: string; question: string }> {
+    const focusAreas = config.focusAreas ?? this.defaultFocusAreas;
+    return focusAreas.map((area) => ({
+      area: area.name,
+      question: this.selectRandomQuestionFromArea(area),
+    }));
+  }
+
+  private async hasRecentFileChanges(
+    targetPatterns: string[] | undefined,
+    transcriptPath?: string
+  ): Promise<boolean> {
+    if (transcriptPath === undefined || transcriptPath === '') {
+      // No transcript path means we're not in a Claude Code session
+      return false;
+    }
+
+    const parser = new TranscriptParser(transcriptPath);
+    if (!parser.exists()) {
+      // Transcript doesn't exist, no changes
+      return false;
+    }
+
+    // Check if there's a previous review marker
+    const lastMarkerIndex = parser.findLastMessageWithMarker(SELF_REVIEW_MARKER);
+
+    if (process.env['DEBUG'] === 'true') {
+      console.error(`Self-review: Last marker index: ${lastMarkerIndex}`);
+    }
+
+    if (lastMarkerIndex === -1) {
+      // No previous review - check last 200 entries (reasonable default)
+      const DEFAULT_LOOKBACK = 200;
+      const hasChanges = parser.hasRecentFileChanges(DEFAULT_LOOKBACK, targetPatterns);
+      if (process.env['DEBUG'] === 'true') {
+        console.error(
+          `Self-review: No marker found, checking last ${DEFAULT_LOOKBACK} entries: ${hasChanges}`
+        );
+      }
+      return hasChanges;
+    }
+
+    // Check for changes since the last review marker
+    const hasChanges = parser.hasFileChangesSinceMarker(SELF_REVIEW_MARKER, targetPatterns);
+    if (process.env['DEBUG'] === 'true') {
+      console.error(
+        `Self-review: Checking changes since marker at ${lastMarkerIndex}: ${hasChanges}`
+      );
+    }
+    return hasChanges;
+  }
+
+  private loadConfig(): SelfReviewConfig {
+    return getHookConfig<SelfReviewConfig>('self-review') ?? {};
+  }
+
+  async execute(context: HookContext): Promise<HookResult> {
+    const { payload } = context;
+    
+    // Extract transcript path for use throughout the function
+    const transcriptPath = payload.transcript_path as string | undefined;
+    
+    if (process.env['DEBUG'] === 'true') {
+      console.error('Self-review: Hook starting');
+    }
+    const stopHookActive = payload.stop_hook_active;
+
+    // Don't trigger if already in a stop hook loop
+    if (stopHookActive === true) {
+      if (process.env['DEBUG'] === 'true') {
+        console.error('Self-review: Skipping due to stop_hook_active');
+      }
+      return { exitCode: 0, suppressOutput: true };
+    }
+
+    // Load configuration
+    const config = this.loadConfig();
+
+    if (process.env['DEBUG'] === 'true') {
+      console.error('Self-review: Checking for file changes since last review');
+    }
+
+    // Check if there were recent file changes matching target patterns
+    const targetPatterns = config.targetPatterns;
+    const hasChanges = await this.hasRecentFileChanges(targetPatterns, transcriptPath);
+    if (!hasChanges) {
+      if (process.env['DEBUG'] === 'true') {
+        console.error('Self-review: No new file changes since last review');
+      }
+      return { exitCode: 0, suppressOutput: true };
+    }
+
+    const questions = this.getReviewQuestions(config);
+    const reviewMessage = await this.constructReviewMessage(questions);
+
+    // For Stop hooks, use exit code 0 with JSON output to control decision
+    console.error(reviewMessage);
+    this.jsonOutput({
+      decision: 'block',
+      reason: reviewMessage,
+    });
+
+    return {
+      exitCode: 0,
+    };
+  }
+
+  private async checkForCodeReviewAgent(): Promise<boolean> {
+    try {
+      const agentLoader = new AgentLoader();
+      // Check if code-review-expert is installed by user (not embedded)
+      return await agentLoader.isAgentInstalledByUser('code-review-expert');
+    } catch (error) {
+      // Error checking for agent
+      if (process.env['DEBUG'] === 'true') {
+        console.error('Self-review: Error checking for code-review-expert agent:', error);
+      }
+      return false;
+    }
+  }
+
+  private async constructReviewMessage(
+    questions: Array<{ area: string; question: string }>
+  ): Promise<string> {
+    // Check if code-review-expert agent is available
+    const hasCodeReviewAgent = await this.checkForCodeReviewAgent();
+
+    // Use consistent header for easy detection in transcript
+    let message = `${SELF_REVIEW_MARKER}
+
+Please review these aspects of your changes:
+
+${questions.map((q) => `**${q.area}:**\n• ${q.question}`).join('\n\n')}
+`;
+
+    if (hasCodeReviewAgent) {
+      message += `
+💡 **Tip:** The code-review-expert subagent is available. Use it to review each self-review topic.
+Use the Task tool with subagent_type: "code-review-expert"
+`;
+    }
+
+    message += '\nAddress any concerns before proceeding.';
+    return message;
+  }
+}
