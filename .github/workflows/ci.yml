@@ -1,0 +1,196 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Validate JSON files
+      run: |
+        # Check all JSON files are valid (exclude TypeScript config files which allow comments)
+        find . -name "*.json" -type f ! -name "tsconfig*.json" -exec jq . {} \; > /dev/null
+        echo "✅ All JSON files are valid"
+    
+    - name: Check file permissions
+      run: |
+        # Ensure all shell scripts are executable
+        find . -name "*.sh" -type f ! -perm -111 -exec echo "❌ Not executable: {}" \; -exec false {} +
+        echo "✅ All shell scripts are executable"
+    
+    - name: Check for sensitive data
+      run: |
+        # Basic check for common sensitive patterns (exclude docs and test files)
+        if grep -r -E "(api_key|password|secret|token).*=.*['\"][^'\"]+['\"]" --include="*.sh" --exclude-dir=docs --exclude-dir=src/agents --exclude="*test*" --exclude="*example*" .; then
+          echo "❌ Potential sensitive data found"
+          exit 1
+        fi
+        echo "✅ No obvious sensitive data found"
+
+  documentation:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Check documentation consistency
+      run: |
+        # Check for hooks documentation (adapted for embedded hooks system)
+        if [ -d ".claude/hooks" ] && [ "$(ls -A .claude/hooks/*.sh 2>/dev/null)" ]; then
+          # Legacy hooks directory exists
+          for hook in .claude/hooks/*.sh; do
+            hook_name=$(basename "$hook" .sh)
+            if ! grep -q "$hook_name" docs/reference/hooks.md; then
+              echo "❌ Missing documentation for $hook_name"
+              exit 1
+            fi
+          done
+        else
+          # Embedded hooks system - check that hooks documentation exists
+          if [ ! -f "docs/reference/hooks.md" ]; then
+            echo "❌ Hooks documentation not found"
+            exit 1
+          fi
+        fi
+        echo "✅ Hooks documentation is present"
+    
+    - name: Check command documentation
+      run: |
+        # Ensure all commands have documentation
+        for cmd in .claude/commands/*.md; do
+          if [[ -f "$cmd" ]]; then
+            cmd_name=$(basename "$cmd" .md)
+            # Check if command has proper frontmatter
+            if ! grep -q "^description:" "$cmd"; then
+              echo "❌ Missing description in $cmd_name"
+              exit 1
+            fi
+          fi
+        done
+        echo "✅ All commands have descriptions"
+
+  symlinks:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Validate symlinks
+      run: |
+        # Check that all symlinks are valid
+        echo "🔍 Validating symlinks..."
+        invalid_links=0
+        
+        # Find all symlinks and check if they point to existing files
+        find . -type l | while read -r link; do
+          if [ -L "$link" ]; then
+            target=$(readlink "$link")
+            # Convert relative path to absolute for checking
+            if [ "${target#/}" = "$target" ]; then
+              # Relative path - resolve it relative to the symlink's directory
+              link_dir=$(dirname "$link")
+              target="$link_dir/$target"
+            fi
+            
+            if [ ! -e "$target" ]; then
+              echo "❌ Broken symlink: $link -> $target"
+              invalid_links=$((invalid_links + 1))
+            else
+              echo "✅ Valid symlink: $link -> $target"
+            fi
+          fi
+        done
+        
+        # Check for broken symlinks with find
+        if find . -type l ! -exec test -e {} \; -print | head -1 | grep -q .; then
+          echo "❌ Found broken symlinks"
+          find . -type l ! -exec test -e {} \; -print
+          exit 1
+        fi
+        
+        echo "✅ All symlinks are valid"
+    
+    - name: Validate command structure
+      run: |
+        # Ensure all commands in .claude/commands/ can be accessed
+        echo "🔍 Validating command file access..."
+        
+        for cmd_file in .claude/commands/**/*.md; do
+          if [[ -f "$cmd_file" ]] || [[ -L "$cmd_file" ]]; then
+            if [[ ! -r "$cmd_file" ]]; then
+              echo "❌ Cannot read command file: $cmd_file"
+              exit 1
+            fi
+            
+            # Check that the file has content
+            if [[ ! -s "$cmd_file" ]]; then
+              echo "❌ Empty command file: $cmd_file"
+              exit 1
+            fi
+            
+            echo "✅ Command file accessible: $cmd_file"
+          fi
+        done
+        
+        echo "✅ All command files are accessible"
+
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    
+    - name: Install dependencies
+      run: npm install
+    
+    - name: Build project
+      run: npm run build
+    
+    - name: Validate dependencies
+      run: npm run validate:deps
+    
+    - name: Test clean installation
+      run: npm run validate:install
+
+  tests:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        
+    - name: Install dependencies
+      run: npm install
+      
+    - name: Run test suite
+      run: |
+        echo "🧪 Running claudekit test suite..."
+        npm test
+        
+    - name: Validate test coverage
+      run: |
+        echo "📊 Validating test coverage..."
+        
+        # Run vitest with coverage to check coverage thresholds
+        npm run test:coverage || {
+          echo "❌ Test coverage validation failed"
+          exit 1
+        }
+        
+        echo "✅ Test coverage validation passed"
