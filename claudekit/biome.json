@@ -1,0 +1,73 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.2.2/schema.json",
+  "vcs": {
+    "enabled": false,
+    "clientKind": "git",
+    "useIgnoreFile": false
+  },
+  "files": {
+    "ignoreUnknown": false,
+    "includes": [
+      "**",
+      "!**/node_modules/",
+      "!**/dist/**",
+      "!**/coverage/**",
+      "!**/build.config.ts",
+      "!**/vitest.config.ts",
+      "!**/temp/",
+      "!**/*.log",
+      "!**/package-lock.json",
+      "!**/pnpm-lock.yaml",
+      "!**/yarn.lock"
+    ]
+  },
+  "formatter": {
+    "enabled": false,
+    "useEditorconfig": true,
+    "formatWithErrors": false,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineEnding": "lf",
+    "lineWidth": 100
+  },
+  "assist": { "actions": { "source": { "organizeImports": "off" } } },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": false,
+      "a11y": { "recommended": false },
+      "complexity": { "recommended": false },
+      "correctness": {
+        "recommended": false,
+        "noUnusedVariables": "error",
+        "noUnreachable": "error", 
+        "noConstAssign": "error"
+      },
+      "nursery": { "recommended": false },
+      "performance": { "recommended": false },
+      "security": {
+        "recommended": false,
+        "noDangerouslySetInnerHtml": "error",
+        "noGlobalEval": "error"
+      },
+      "style": { "recommended": false },
+      "suspicious": {
+        "recommended": false,
+        "noExplicitAny": "off",
+        "noDebugger": "error"
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["**/tests/**/*.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noExplicitAny": "off"
+          }
+        }
+      }
+    }
+  ]
+}

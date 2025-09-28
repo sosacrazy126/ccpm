@@ -1,0 +1,236 @@
+name: Release Package
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      release-type:
+        description: 'Release type (patch, minor, major)'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+  workflow_run:
+    workflows: ["CI", "Test Hooks"]
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  check-prerequisites:
+    name: Check Prerequisites
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    outputs:
+      can-proceed: ${{ steps.check.outputs.can-proceed }}
+    
+    steps:
+    - name: Check workflow prerequisites
+      id: check
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_run" ]; then
+          if [ "${{ github.event.workflow_run.conclusion }}" = "success" ]; then
+            echo "Prerequisite workflow succeeded"
+            echo "can-proceed=true" >> $GITHUB_OUTPUT
+          else
+            echo "Prerequisite workflow failed: ${{ github.event.workflow_run.conclusion }}"
+            echo "can-proceed=false" >> $GITHUB_OUTPUT
+          fi
+        else
+          echo "Manual trigger - proceeding with release"
+          echo "can-proceed=true" >> $GITHUB_OUTPUT
+        fi
+
+  check-version:
+    name: Check Version and Prepare Release
+    needs: check-prerequisites
+    if: needs.check-prerequisites.outputs.can-proceed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      should-release: ${{ steps.check.outputs.should-release }}
+      version: ${{ steps.check.outputs.version }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Check if version changed
+      id: check
+      run: |
+        # Get current version from package.json
+        CURRENT_VERSION=$(node -p "require('./package.json').version")
+        echo "Current version: $CURRENT_VERSION"
+        
+        # Check if tag already exists
+        if git tag | grep -q "^v$CURRENT_VERSION$"; then
+          echo "Tag v$CURRENT_VERSION already exists. Skipping release."
+          echo "should-release=false" >> $GITHUB_OUTPUT
+        else
+          echo "Tag v$CURRENT_VERSION does not exist. Proceeding with release."
+          echo "should-release=true" >> $GITHUB_OUTPUT
+          echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+        fi
+
+  release:
+    name: Build and Publish
+    needs: [check-prerequisites, check-version]
+    if: needs.check-prerequisites.outputs.can-proceed == 'true' && needs.check-version.outputs.should-release == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        registry-url: 'https://registry.npmjs.org'
+    
+    - name: Install dependencies
+      run: npm install
+    
+    - name: Run tests
+      run: |
+        npm run test:ci
+        npm run lint
+        npm run typecheck
+    
+    - name: Build package
+      run: npm run build
+    
+    - name: Validate build output
+      run: |
+        # Check that dist directory exists and contains files
+        if [ ! -d "dist" ] || [ -z "$(ls -A dist)" ]; then
+          echo "::error::Build output directory 'dist' is empty or missing"
+          exit 1
+        fi
+        
+        # Check that main entry point exists
+        if [ ! -f "dist/index.cjs" ]; then
+          echo "::error::Main entry point 'dist/index.cjs' is missing"
+          exit 1
+        fi
+        
+        # Check that type definitions exist
+        if [ ! -f "dist/index.d.ts" ]; then
+          echo "::error::Type definitions 'dist/index.d.ts' are missing"
+          exit 1
+        fi
+        
+        # Check that CLI entry point exists
+        if [ ! -f "bin/claudekit" ]; then
+          echo "::error::CLI entry point 'bin/claudekit' is missing"
+          echo "Contents of bin directory:"
+          ls -la bin/ || echo "bin directory not found"
+          exit 1
+        fi
+        
+        echo "Build validation passed ✓"
+    
+    - name: Create release tag
+      run: |
+        VERSION=${{ needs.check-version.outputs.version }}
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git tag -a "v$VERSION" -m "Release v$VERSION"
+        git push origin "v$VERSION"
+    
+    - name: Publish to npm
+      run: npm publish --access public
+      env:
+        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    
+    - name: Extract changelog for version
+      id: changelog
+      run: |
+        VERSION=${{ needs.check-version.outputs.version }}
+        
+        # Extract the changelog content for this version
+        # Start from the version header and stop at the next version header or end of file
+        CHANGELOG_CONTENT=$(awk -v version="$VERSION" '
+          BEGIN { found = 0; content = "" }
+          /^## \[/ {
+            if (found == 1) { exit }
+            if ($0 ~ "## \\[" version "\\]") { found = 1; next }
+          }
+          found == 1 { content = content $0 "\n" }
+          END { print content }
+        ' CHANGELOG.md)
+        
+        # If no content found for exact version, try without brackets
+        if [ -z "$CHANGELOG_CONTENT" ]; then
+          CHANGELOG_CONTENT=$(awk -v version="$VERSION" '
+            BEGIN { found = 0; content = "" }
+            /^## / {
+              if (found == 1) { exit }
+              if ($0 ~ version) { found = 1; next }
+            }
+            found == 1 { content = content $0 "\n" }
+            END { print content }
+          ' CHANGELOG.md)
+        fi
+        
+        # Create release notes file
+        mkdir -p .github
+        cat > .github/release_notes.md << EOF
+        ## Installation
+        
+        \`\`\`bash
+        npm install -g claudekit@$VERSION
+        \`\`\`
+        
+        ## What's Changed
+        
+        $CHANGELOG_CONTENT
+        
+        ## Links
+        
+        - 📖 [Full Changelog](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)
+        - 🔗 [NPM Package](https://www.npmjs.com/package/claudekit/v/$VERSION)
+        - 📦 [All Releases](https://github.com/${{ github.repository }}/releases)
+        
+        ---
+        
+        *For the complete list of changes across all versions, see the [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) file.*
+        EOF
+        
+        echo "Created release notes for version $VERSION"
+    
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ needs.check-version.outputs.version }}
+        name: Release v${{ needs.check-version.outputs.version }}
+        body_path: .github/release_notes.md
+        draft: false
+        prerelease: false
+
+  post-release:
+    name: Post-Release Actions
+    needs: [check-prerequisites, check-version, release]
+    if: needs.check-prerequisites.outputs.can-proceed == 'true' && needs.check-version.outputs.should-release == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Notify on failure
+      if: failure()
+      run: |
+        echo "::error::Release failed! Please check the logs and fix any issues."

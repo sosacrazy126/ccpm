@@ -1,0 +1,354 @@
+/**
+ * Tests for the doctor command
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import { doctor } from '../../cli/commands/doctor';
+import {
+  TestFileSystem,
+  // TestAssertions, // Removed unused import
+  CommandTestHelper,
+  ConsoleTestHelper,
+} from '../utils/test-helpers.ts';
+
+// Mock external dependencies
+vi.mock('ora', () => ({
+  default: vi.fn(() => ({
+    start: vi.fn().mockReturnThis(),
+    stop: vi.fn().mockReturnThis(),
+    succeed: vi.fn().mockReturnThis(),
+    fail: vi.fn().mockReturnThis(),
+    text: '',
+  })),
+}));
+
+vi.mock('chalk', () => {
+  interface ChalkInstance {
+    (text: string): string;
+    bold: ChalkInstance;
+    dim: ChalkInstance;
+    italic: ChalkInstance;
+    underline: ChalkInstance;
+    green: ChalkInstance;
+    red: ChalkInstance;
+    yellow: ChalkInstance;
+    blue: ChalkInstance;
+    gray: ChalkInstance;
+  }
+
+  const createChainableInstance = (): ChalkInstance => {
+    const mock: ChalkInstance = ((text: string) => text) as ChalkInstance;
+    mock.bold = createChainableInstance();
+    mock.dim = createChainableInstance();
+    mock.italic = createChainableInstance();
+    mock.underline = createChainableInstance();
+    mock.green = createChainableInstance();
+    mock.red = createChainableInstance();
+    mock.yellow = createChainableInstance();
+    mock.blue = createChainableInstance();
+    mock.gray = createChainableInstance();
+    return mock;
+  };
+
+  return {
+    default: {
+      green: createChainableInstance(),
+      red: createChainableInstance(),
+      yellow: createChainableInstance(),
+      blue: createChainableInstance(),
+      gray: createChainableInstance(),
+      bold: createChainableInstance(),
+      dim: createChainableInstance(),
+    },
+  };
+});
+
+describe('doctor command', () => {
+  let testFs: TestFileSystem;
+  let tempDir: string;
+  let restoreCwd: () => void;
+  // let console: ReturnType<typeof ConsoleTestHelper.mockConsole>; // Removed unused variable
+  let processExit: ReturnType<typeof CommandTestHelper.mockProcessExit>;
+
+  beforeEach(async () => {
+    testFs = new TestFileSystem();
+    tempDir = await testFs.createTempDir();
+    restoreCwd = CommandTestHelper.mockProcessCwd(tempDir);
+    ConsoleTestHelper.mockConsole();
+    processExit = CommandTestHelper.mockProcessExit();
+
+    // Reset mocks
+    vi.clearAllMocks();
+  });
+
+  afterEach(async () => {
+    await testFs.cleanup();
+    restoreCwd();
+    ConsoleTestHelper.restore();
+    processExit.cleanup();
+    vi.clearAllMocks();
+  });
+
+  describe('successful validation', () => {
+    it('should pass validation with complete setup', async () => {
+      // Create complete .claude setup
+      await testFs.createFileStructure(tempDir, {
+        '.claude': {
+          'settings.json': JSON.stringify(
+            {
+              hooks: {
+                PostToolUse: [
+                  {
+                    matcher: 'tools:Write AND file_paths:**/*.ts',
+                    hooks: [
+                      {
+                        type: 'command',
+                        command: 'claudekit-hooks run typecheck-changed',
+                      },
+                    ],
+                  },
+                ],
+                Stop: [
+                  {
+                    matcher: '*',
+                    hooks: [
+                      {
+                        type: 'command',
+                        command: 'claudekit-hooks run create-checkpoint',
+                      },
+                    ],
+                  },
+                ],
+              },
+            },
+            null,
+            2
+          ),
+          commands: {},
+        },
+      });
+
+      await doctor({});
+
+      // Should not exit with error
+      expect(processExit.exit).not.toHaveBeenCalled();
+
+      // Check success messages
+      const output = ConsoleTestHelper.getOutput('log').join('\n');
+      expect(output).toContain('✓');
+      expect(output).toContain('.claude directory exists');
+      expect(output).toContain('settings.json is valid');
+      expect(output).toContain('Found 2 hook(s)');
+      expect(output).toContain('All diagnostic checks passed!');
+    });
+
+    it('should handle empty hooks directory', async () => {
+      await testFs.createFileStructure(tempDir, {
+        '.claude': {
+          'settings.json': JSON.stringify({ hooks: {} }),
+          hooks: {},
+          commands: {},
+        },
+      });
+
+      await doctor({});
+
+      expect(processExit.exit).not.toHaveBeenCalled();
+
+      const output = ConsoleTestHelper.getOutput('log').join('\n');
+      expect(output).toContain('Found 0 hook(s)');
+    });
+  });
+
+  describe('validation failures', () => {
+    it('should fail when .claude directory does not exist', async () => {
+      await doctor({});
+
+      expect(processExit.exit).toHaveBeenCalledWith(1);
+
+      const output = ConsoleTestHelper.getOutput('log').join('\n');
+      expect(output).toContain('✗');
+      expect(output).toContain('.claude directory not found');
+      expect(output).toContain('run "claudekit setup" first');
+      expect(output).toContain('Some diagnostic checks failed.');
+    });
+
+    it('should fail when settings.json does not exist', async () => {
+      await testFs.createFileStructure(tempDir, {
+        '.claude': {
+          hooks: {},
+        },
+      });
+
+      await doctor({});
+
+      expect(processExit.exit).toHaveBeenCalledWith(1);
+
+      const output = ConsoleTestHelper.getOutput('log').join('\n');
+      expect(output).toContain('✓'); // .claude directory exists
+      expect(output).toContain('✗'); // settings.json issues
+      expect(output).toContain('settings.json not found');
+    });
+
+    it('should fail when settings.json contains invalid JSON', async () => {
+      await testFs.createFileStructure(tempDir, {
+        '.claude': {
+          'settings.json': '{ invalid json }',
+          hooks: {},
+        },
+      });
+
+      await doctor({});
+
+      expect(processExit.exit).toHaveBeenCalledWith(1);
+
+      const output = ConsoleTestHelper.getOutput('log').join('\n');
+      expect(output).toContain('settings.json contains invalid JSON');
+    });
+
+    it('should pass when hooks directory does not exist', async () => {
+      await testFs.createFileStructure(tempDir, {
+        '.claude': {
+          'settings.json': JSON.stringify({ hooks: {} }),
+        },
+      });
+
+      await doctor({});
+
+      // Should not exit with error - missing hooks is valid
+      expect(processExit.exit).not.toHaveBeenCalled();
+
+      const output = ConsoleTestHelper.getOutput('log').join('\n');
+      expect(output).toContain('Found 0 hook(s)');
+      expect(output).toContain('✓');
+    });
+
+    it('should fail when settings.json is missing', async () => {
+      // Only create .claude directory, nothing else
+      await fs.mkdir(path.join(tempDir, '.claude'));
+
+      await doctor({});
+
+      expect(processExit.exit).toHaveBeenCalledWith(1);
+
+      const output = ConsoleTestHelper.getOutput('log').join('\n');
+      expect(output).toContain('✓'); // .claude directory exists
+      expect(output).toContain('settings.json not found');
+      expect(output).toContain('Found 0 hook(s)'); // Missing hooks is not a failure
+      expect(output).toContain('No commands installed'); // Missing commands is not a failure
+
+      // Should have exactly one ✗ symbol (only settings.json)
+      const matches = output.match(/✗/g);
+      const failureCount = matches !== null ? matches.length : 0;
+      expect(failureCount).toBe(1);
+    });
+  });
+
+  describe('edge cases', () => {
+    it('should handle valid JSON that is not an object', async () => {
+      await testFs.createFileStructure(tempDir, {
+        '.claude': {
+          'settings.json': '"string is valid JSON but not config"',
+          hooks: {},
+        },
+      });
+
+      await doctor({});
+
+      // Should still pass JSON validation (this tests that we don't schema doctor in the doctor command)
+      const output = ConsoleTestHelper.getOutput('log').join('\n');
+      expect(output).toContain('settings.json is valid');
+    });
+
+    it('should handle empty settings.json', async () => {
+      await testFs.createFileStructure(tempDir, {
+        '.claude': {
+          'settings.json': '',
+          hooks: {},
+        },
+      });
+
+      await doctor({});
+
+      expect(processExit.exit).toHaveBeenCalledWith(1);
+
+      const output = ConsoleTestHelper.getOutput('log').join('\n');
+      expect(output).toContain('settings.json contains invalid JSON');
+    });
+
+    it('should count hooks correctly with nested directories', async () => {
+      await testFs.createFileStructure(tempDir, {
+        '.claude': {
+          'settings.json': JSON.stringify({ hooks: {} }),
+          hooks: {
+            'typecheck.sh': '#!/bin/bash',
+            nested: {
+              'other.sh': '#!/bin/bash',
+            },
+            '.hidden': 'hidden file',
+            'README.md': 'documentation',
+          },
+        },
+      });
+
+      await doctor({});
+
+      const output = ConsoleTestHelper.getOutput('log').join('\n');
+      // Should count all items in hooks directory (files and subdirectories)
+      expect(output).toMatch(/Found \d+ hook\(s\)/);
+    });
+  });
+
+  describe('ora spinner integration', () => {
+    it('should use spinner during validation', async () => {
+      await testFs.createFileStructure(tempDir, {
+        '.claude': {
+          'settings.json': JSON.stringify({ hooks: {} }),
+          hooks: {},
+        },
+      });
+
+      await doctor({});
+
+      // Verify ora was called
+      const ora = await import('ora');
+      expect(ora.default).toHaveBeenCalledWith('Running diagnostic checks...');
+    });
+
+    it('should handle spinner errors gracefully', async () => {
+      // Mock fs.access to throw an unexpected error
+      const accessSpy = vi
+        .spyOn(fs, 'access')
+        .mockRejectedValueOnce(new Error('Unexpected filesystem error'));
+
+      // Should not throw, but handle error gracefully
+      await doctor({});
+
+      // Verify that the error was handled (access was called)
+      expect(accessSpy).toHaveBeenCalled();
+
+      accessSpy.mockRestore();
+    });
+  });
+
+  describe('options parameter', () => {
+    it('should accept options parameter without using it', async () => {
+      await testFs.createFileStructure(tempDir, {
+        '.claude': {
+          'settings.json': JSON.stringify({ hooks: {} }),
+          hooks: {},
+        },
+      });
+
+      // Test that options parameter is accepted but doesn't affect behavior
+      await doctor({ type: 'full' });
+      await doctor({ type: 'quick' });
+      await doctor({});
+
+      // All should behave the same way
+      expect(processExit.exit).not.toHaveBeenCalled();
+    });
+  });
+});
